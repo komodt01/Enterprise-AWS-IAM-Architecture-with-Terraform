@@ -1,233 +1,364 @@
-# Infrastructure Teardown Guide
+# Terraform Teardown Guide
 
-## ⚠️ IMPORTANT WARNING
-This teardown process will permanently delete all AWS resources created by this project. Ensure you have:
-- Backed up any important data or configurations
-- Confirmed this is the correct AWS account
-- Obtained necessary approvals for resource deletion
+## Purpose
 
-## Pre-Teardown Checklist
+This document describes how to remove resources created by the Terraform configurations in this repository.
 
-### 1. Document Current State
-```bash
-# Generate final reports before teardown
-make access-report
-make compliance-report
+The project contains two independent Terraform configurations:
 
-# Export current Terraform state
-terraform show > pre-teardown-state.txt
+```text
+terraform/
+├── iam/
+└── org/
 ```
 
-### 2. Check Dependencies
-- Verify no production workloads depend on these IAM resources
-- Confirm no users are actively using the roles/policies
-- Check for any manual resources that reference the IAM roles
+They should be reviewed and managed separately because they operate at different security and governance scopes.
 
-### 3. Backup Configuration
+---
+
+## Important
+
+Terraform destruction can permanently remove AWS security resources.
+
+Before running `terraform destroy`:
+
+- Confirm the AWS account and active identity
+- Review the Terraform plan
+- Confirm the resources belong to this project
+- Verify that no workloads or users depend on the IAM role or policies
+- Review organization-level resources separately from account-level IAM resources
+
+Do not run destructive commands against an AWS environment without understanding their impact.
+
+---
+
+## Verify AWS Identity
+
+Before performing Terraform operations, confirm the AWS identity being used:
+
 ```bash
-# Backup Terraform state
-cp terraform.tfstate terraform.tfstate.backup.$(date +%Y%m%d_%H%M%S)
-
-# Backup configuration files
-tar -czf iam-config-backup-$(date +%Y%m%d_%H%M%S).tar.gz terraform/ examples/ scripts/
+aws sts get-caller-identity
 ```
 
-## Teardown Order (CRITICAL - Follow Sequence)
+Verify that the returned account is the intended AWS account.
 
-### Step 1: Remove Service Control Policies
-SCPs must be detached before deleting organizational units.
+---
 
-```bash
-cd terraform/org
-terraform destroy -target=aws_organizations_policy_attachment.security_scp
-terraform destroy -target=aws_organizations_policy_attachment.region_restriction_scp
+# IAM Teardown
+
+The IAM implementation is located in:
+
+```text
+terraform/iam/
 ```
 
-### Step 2: Detach IAM Policies
-Detach policies from roles and groups before deletion.
+It contains:
+
+- Security Architect IAM role
+- Role trust policy
+- Read-oriented IAM permissions policy
+- Department/environment ABAC policy
+- Policy attachments
+
+---
+
+## Initialize Terraform
+
+Navigate to the IAM configuration:
 
 ```bash
 cd terraform/iam
-terraform destroy -target=aws_iam_role_policy_attachment.engineering_abac
-terraform destroy -target=aws_iam_role_policy_attachment.marketing_abac
-# Repeat for all policy attachments
 ```
 
-### Step 3: Destroy IAM Resources
+Initialize the working directory:
+
 ```bash
-# From project root
-make destroy-iam
+terraform init
 ```
 
-### Step 4: Remove Organization Resources
+---
+
+## Review Current State
+
+If the configuration has previously been deployed using the current Terraform state, inspect the managed resources:
+
 ```bash
-cd terraform/org
+terraform state list
+```
+
+You can also review the configuration and current state with:
+
+```bash
+terraform show
+```
+
+---
+
+## Create a Destruction Plan
+
+Before deleting anything, generate a destruction plan:
+
+```bash
+terraform plan -destroy
+```
+
+Review the output carefully.
+
+Expected resources may include:
+
+```text
+aws_iam_role.security_architect
+aws_iam_policy.security_architect
+aws_iam_policy.department_abac
+aws_iam_role_policy_attachment.security_architect
+aws_iam_role_policy_attachment.department_abac
+```
+
+The exact plan should be treated as the authoritative source for what Terraform intends to remove.
+
+---
+
+## Destroy IAM Resources
+
+After reviewing the plan:
+
+```bash
 terraform destroy
 ```
 
-### Step 5: Clean Up State and Remote Resources
-```bash
-# Remove Terraform state bucket (if using remote state)
-aws s3 rb s3://iam-terraform-248839917024-komodt --force
+Terraform will display the proposed changes and request confirmation before proceeding.
 
-# Clean up any remaining resources
-make cleanup
+Avoid `-auto-approve` for security-sensitive teardown unless automation requirements and safeguards have been deliberately designed.
+
+---
+
+## Verify IAM Removal
+
+After Terraform completes, verify that the resources are no longer managed:
+
+```bash
+terraform state list
 ```
 
-## Automated Teardown
+You can also verify relevant AWS resources using the AWS CLI.
 
-### Quick Teardown (Use with Caution)
+For example:
+
 ```bash
-# Complete infrastructure destruction
-make teardown-all
-
-# This runs:
-# 1. terraform destroy -auto-approve
-# 2. Removes S3 state bucket
-# 3. Cleans up local state files
+aws iam get-role --role-name SecurityArchitect-development
 ```
 
-### Safe Teardown
-```bash
-# Interactive teardown with confirmations
-make safe-teardown
+If the role was successfully removed, AWS should return a `NoSuchEntity` response.
 
-# This provides step-by-step confirmations
+Environment-specific role names may differ depending on the Terraform variable values used during deployment.
+
+---
+
+# AWS Organizations Teardown
+
+The organization-level Terraform configuration is located in:
+
+```text
+terraform/org/
 ```
 
-## Manual Cleanup Steps
+This configuration defines the regional Service Control Policy:
 
-### 1. AWS Console Verification
-After Terraform destroy, verify in AWS Console:
-- IAM → Roles: Should show no custom roles
-- IAM → Policies: Should show no custom policies  
-- Organizations → SCPs: Should show no custom SCPs
-- Access Analyzer: Should show no remaining analyzers
-
-### 2. Remove Local Files
-```bash
-# Remove Terraform state files
-rm -f terraform.tfstate*
-rm -rf .terraform/
-
-# Remove generated reports
-rm -f reports/*.json
-rm -f logs/*.log
-
-# Remove backup files (if no longer needed)
-rm -f *.backup.*
+```text
+ApprovedRegionsGuardrail
 ```
 
-### 3. Clean Git History (Optional)
+The current project intentionally does **not** attach the SCP to an organizational unit or AWS account.
+
+---
+
+## Organization-Level Caution
+
+SCPs operate at an AWS Organizations governance layer and can affect permissions across multiple accounts when attached.
+
+Always verify the organization and policy status before modifying or deleting organization-level controls.
+
+Confirm the current AWS identity:
+
 ```bash
-# Remove sensitive data from git history if committed
-git filter-branch --force --index-filter \
-  'git rm --cached --ignore-unmatch terraform.tfvars' \
-  --prune-empty --tag-name-filter cat -- --all
-```
-
-## Troubleshooting Common Issues
-
-### Issue: "Resource still in use"
-**Problem**: IAM roles attached to EC2 instances or other resources
-**Solution**: 
-```bash
-# Find dependencies
-aws iam list-entities-for-policy --policy-arn <policy-arn>
-aws iam list-role-policies --role-name <role-name>
-
-# Remove dependencies first, then retry teardown
-```
-
-### Issue: "Access Denied"
-**Problem**: Insufficient permissions to delete resources
-**Solution**:
-```bash
-# Verify current permissions
 aws sts get-caller-identity
-aws iam simulate-principal-policy --policy-source-arn <user-arn> --action-names iam:DeleteRole
 ```
 
-### Issue: "Organization member accounts exist"
-**Problem**: Cannot delete organization with member accounts
-**Solution**:
-```bash
-# List member accounts
-aws organizations list-accounts
+If appropriate, inspect the organization:
 
-# Remove member accounts first (if safe to do so)
-aws organizations remove-account-from-organization --account-id <account-id>
+```bash
+aws organizations describe-organization
 ```
 
-### Issue: Terraform state corruption
-**Problem**: State file inconsistency
-**Solution**:
+---
+
+## Initialize the Organizations Configuration
+
+Navigate to:
+
 ```bash
-# Import existing resources
-terraform import aws_iam_role.example <role-name>
-
-# Or refresh state
-terraform refresh
-
-# Force unlock if locked
-terraform force-unlock <lock-id>
+cd terraform/org
 ```
 
-## Verification Steps
+Initialize Terraform:
 
-### Post-Teardown Verification
 ```bash
-# Verify no custom IAM resources remain
-aws iam list-roles --query 'Roles[?contains(RoleName, `Engineering`) || contains(RoleName, `Marketing`)]'
+terraform init
+```
+
+---
+
+## Review the Destruction Plan
+
+Run:
+
+```bash
+terraform plan -destroy
+```
+
+The expected managed resource is the SCP definition:
+
+```text
+aws_organizations_policy.region_guardrail
+```
+
+Review the Terraform output before proceeding.
+
+---
+
+## Verify SCP Attachments
+
+Although this repository does not configure an SCP attachment, verify the current AWS environment before deleting an organization policy.
+
+For example:
+
+```bash
+aws organizations list-targets-for-policy \
+  --policy-id <policy-id>
+```
+
+If a policy has been attached manually or by another process, investigate that dependency before attempting removal.
+
+Do not assume that the current repository represents every change that may have occurred in the AWS environment.
+
+---
+
+## Destroy the SCP Definition
+
+If the Terraform plan is correct and the policy has no required external dependencies:
+
+```bash
+terraform destroy
+```
+
+Review the proposed action before confirming destruction.
+
+---
+
+# Terraform State
+
+Terraform relies on state to map configuration resources to deployed infrastructure.
+
+This repository intentionally excludes local state files from Git:
+
+```text
+*.tfstate
+*.tfstate.*
+```
+
+If the project was deployed using local state, retain the state until teardown has been successfully completed and verified.
+
+Deleting Terraform state **before** destroying infrastructure does not delete the AWS resources. It only removes Terraform's record of those resources.
+
+---
+
+## If Terraform State Is Missing
+
+Do not assume the AWS resources no longer exist simply because Terraform state is unavailable.
+
+Use AWS tooling to determine whether relevant resources still exist.
+
+Examples:
+
+```bash
+aws iam list-roles
+```
+
+```bash
 aws iam list-policies --scope Local
-
-# Check for orphaned resources
-aws iam list-role-policies --role-name <any-remaining-role>
-
-# Verify billing impact
-aws ce get-cost-and-usage --time-period Start=2023-01-01,End=2023-12-31 --granularity MONTHLY --metrics UnblendedCost
 ```
 
-### Security Verification
 ```bash
-# Ensure no backdoor access remains
-aws iam get-account-authorization-details > post-teardown-iam-state.json
-
-# Compare with baseline
-diff baseline-iam-state.json post-teardown-iam-state.json
+aws organizations list-policies \
+  --filter SERVICE_CONTROL_POLICY
 ```
 
-## Recovery Options
+If resources exist but are no longer represented in Terraform state, determine whether they should be imported, managed manually, or left in place before taking destructive action.
 
-### Partial Recovery
-If you need to restore some components:
+---
+
+# Post-Teardown Validation
+
+After teardown, verify both Terraform and AWS state.
+
+For IAM:
+
 ```bash
-# Restore from backup
-tar -xzf iam-config-backup-<timestamp>.tar.gz
-
-# Selective apply
-terraform plan -target=aws_iam_role.engineering_role
-terraform apply -target=aws_iam_role.engineering_role
+cd terraform/iam
+terraform state list
 ```
 
-### Full Recovery
+For Organizations:
+
 ```bash
-# Restore complete infrastructure
-git checkout <last-working-commit>
-make init
-make apply
+cd terraform/org
+terraform state list
 ```
 
-## Final Notes
+Also verify the relevant AWS resources directly.
 
-- Keep backup files for at least 30 days after teardown
-- Document any lessons learned during teardown
-- Update runbooks based on any issues encountered
-- Consider setting up monitoring alerts for accidental deletions in the future
+The objective is to confirm:
 
-## Emergency Contacts
+```text
+Terraform no longer manages the resources
+                +
+AWS no longer contains the resources intended for removal
+```
 
-If teardown causes production issues:
-- AWS Support: Create a support case immediately
-- Internal escalation: Follow your organization's incident response procedures
-- Document all actions taken for post-incident review
+---
+
+## Security Considerations
+
+Teardown is part of the security lifecycle.
+
+Removing IAM resources should account for:
+
+- Active role sessions
+- External dependencies
+- Manually created policy attachments
+- Resources created outside Terraform
+- Organization-level policy dependencies
+- Terraform state integrity
+- Audit requirements
+
+In a production environment, destructive infrastructure changes would normally be governed through change management, peer review, approvals, logging, and recovery procedures.
+
+Those governance processes are outside the scope of this repository.
+
+---
+
+## Current Project Scope
+
+This guide applies only to resources represented by the current Terraform implementation.
+
+It does not assume the existence of:
+
+- Makefile automation
+- Terraform remote-state buckets
+- Automated compliance reports
+- Cleanup scripts
+- CI/CD pipelines
+- Production workloads
+- AWS Organizations OU structures
+
+This keeps teardown instructions aligned with the implementation actually present in the repository.
